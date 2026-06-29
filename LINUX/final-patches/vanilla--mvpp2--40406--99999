@@ -58,7 +58,54 @@ index d3f644cad57d..386664b767d7 100644
  	mvpp2_qvec_interrupt_disable(qv);
  
  	napi_schedule(&qv->napi);
-@@ -4382,6 +4399,12 @@ static netdev_tx_t mvpp2_tx(struct sk_buff *skb, struct net_device *dev)
+@@ -3536,8 +3553,22 @@ static enum hrtimer_restart mvpp2_hr_timer_cb(struct hrtimer *timer)
+ 	port_pcpu = container_of(timer, struct mvpp2_port_pcpu, tx_done_timer);
+ 	dev = port_pcpu->dev;
+ 
+-	if (!netif_running(dev))
++	if (!netif_running(dev)) {
++#ifdef CONFIG_NETMAP
++		/* Unlike the native (!has_tx_irqs) use of this timer, which
++		 * is only ever kicked from a live mvpp2_tx() call and so can
++		 * assume the interface was already up, mvpp2_netmap_reg()
++		 * starts this timer proactively at registration time - which
++		 * can race ahead of the interface actually being brought up.
++		 * Keep polling instead of dying permanently in that case. */
++		if (nm_netmap_on(NA(dev))) {
++			hrtimer_forward_now(&port_pcpu->tx_done_timer,
++					    MVPP2_TXDONE_HRTIMER_PERIOD_NS);
++			return HRTIMER_RESTART;
++		}
++#endif
+ 		return HRTIMER_NORESTART;
++	}
+ 
+ 	port_pcpu->timer_scheduled = false;
+ 	port = netdev_priv(dev);
+@@ -3547,8 +3578,21 @@ static enum hrtimer_restart mvpp2_hr_timer_cb(struct hrtimer *timer)
+ 	tx_todo = mvpp2_tx_done(port, cause,
+ 				mvpp2_cpu_to_thread(port->priv, smp_processor_id()));
+ 
+-	/* Set the timer in case not all the packets were processed */
++	/* Set the timer in case not all the packets were processed.
++	 *
++	 * In netmap mode TX-done IRQs are masked, so for has_tx_irqs ports
++	 * this timer is started as the only mechanism left to reap TX
++	 * completions and wake a stalled queue (see
++	 * mvpp2_netmap_tx_timer_start()). Keep it running for as long as
++	 * netmap is active on this port, not just while there is
++	 * outstanding work, since a currently-idle queue can stall again at
++	 * any time and nothing else will restart the timer.
++	 */
++#ifdef CONFIG_NETMAP
++	if ((tx_todo || nm_netmap_on(NA(dev))) && !port_pcpu->timer_scheduled) {
++#else
+ 	if (tx_todo && !port_pcpu->timer_scheduled) {
++#endif
+ 		port_pcpu->timer_scheduled = true;
+ 		hrtimer_forward_now(&port_pcpu->tx_done_timer,
+ 				    MVPP2_TXDONE_HRTIMER_PERIOD_NS);
+@@ -4395,6 +4439,12 @@ static netdev_tx_t mvpp2_tx(struct sk_buff *skb, struct net_device *dev)
  	}
  	frags = skb_shinfo(skb)->nr_frags + 1;
  
@@ -71,7 +118,7 @@ index d3f644cad57d..386664b767d7 100644
  	/* Check number of available descriptors */
  	if (mvpp2_aggr_desc_num_check(port, aggr_txq, frags) ||
  	    mvpp2_txq_reserved_desc_num_proc(port, txq, txq_pcpu, frags)) {
-@@ -5831,7 +5854,11 @@ static const struct net_device_ops mvpp2_netdev_ops = {
+@@ -5851,7 +5901,11 @@ static const struct net_device_ops mvpp2_netdev_ops = {
  	.ndo_start_xmit		= mvpp2_tx,
  	.ndo_set_rx_mode	= mvpp2_set_rx_mode,
  	.ndo_set_mac_address	= mvpp2_set_mac_address,
@@ -83,7 +130,7 @@ index d3f644cad57d..386664b767d7 100644
  	.ndo_get_stats64	= mvpp2_get_stats64,
  	.ndo_eth_ioctl		= mvpp2_ioctl,
  	.ndo_vlan_rx_add_vid	= mvpp2_vlan_rx_add_vid,
-@@ -7138,6 +7165,9 @@ static void mvpp2_port_remove(struct mvpp2_port *port)
+@@ -7169,6 +7223,9 @@ static void mvpp2_port_remove(struct mvpp2_port *port)
  {
  	int i;
  
@@ -93,7 +140,7 @@ index d3f644cad57d..386664b767d7 100644
  	unregister_netdev(port->dev);
  	if (port->phylink)
  		phylink_destroy(port->phylink);
-@@ -7743,6 +7773,12 @@ static int mvpp2_probe(struct platform_device *pdev)
+@@ -7773,6 +7830,12 @@ static int mvpp2_probe(struct platform_device *pdev)
  	mvpp2_dbgfs_init(priv, pdev->name);
  
  	platform_set_drvdata(pdev, priv);

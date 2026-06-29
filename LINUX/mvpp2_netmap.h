@@ -75,6 +75,7 @@ static void mvpp2_rxq_drop_pkts(struct mvpp2_port *port, struct mvpp2_rx_queue *
 static void mvpp2_bm_bufs_get_addrs(struct device *dev, struct mvpp2 *priv, struct mvpp2_bm_pool *bm_pool, dma_addr_t *dma_addr, phys_addr_t *phys_addr);
 static void mvpp2_ingress_enable(struct mvpp2_port *port);
 static void mvpp2_ingress_disable(struct mvpp2_port *port);
+static enum hrtimer_restart mvpp2_hr_timer_cb(struct hrtimer *timer);
 
 
 /* Mask/unmask TX interupts - we will process tx completion before sending new packets */
@@ -93,6 +94,91 @@ static void mvpp2_netmap_unmask_tx_interrupts(struct mvpp2_port *port, unsigned 
 		val |= MVPP2_CAUSE_TXQ_OCCUP_DESC_ALL_MASK;
 		mvpp2_thread_write(port->priv, thread, MVPP2_ISR_RX_TX_MASK_REG(port->id), val);
 	}
+}
+
+/* HRTIMER_MODE_REL_PINNED_SOFT pins a timer to whichever CPU calls
+ * hrtimer_start()/hrtimer_cancel(), not to whichever per-thread pcpu struct
+ * it operates on. mvpp2_hr_timer_cb() relies on that pinning to recover its
+ * own thread index via smp_processor_id(), so these must each run on the
+ * CPU that owns the given thread - same reasoning as mvpp2_interrupts_mask()
+ * / mvpp2_interrupts_unmask(), which use the same on_each_cpu() pattern. */
+static void mvpp2_netmap_tx_timer_start_cpu(void *arg)
+{
+	struct mvpp2_port *port = arg;
+	int cpu = smp_processor_id();
+	struct mvpp2_port_pcpu *port_pcpu;
+	unsigned int thread;
+
+	if (cpu >= port->priv->nthreads)
+		return;
+
+	thread = mvpp2_cpu_to_thread(port->priv, cpu);
+	port_pcpu = per_cpu_ptr(port->pcpu, thread);
+
+	/* has_tx_irqs ports never set this timer up at probe time (they
+	 * normally rely on the TX-done IRQ instead) - do it now, the first
+	 * time it's actually needed. !has_tx_irqs ports already did this at
+	 * probe (mvpp2_probe()); re-running hrtimer_init() on a timer that
+	 * may still be armed from normal (non-netmap) operation is unsafe,
+	 * so leave their existing timer alone and just make sure it's
+	 * running below. */
+	if (port->has_tx_irqs) {
+		hrtimer_init(&port_pcpu->tx_done_timer, CLOCK_MONOTONIC,
+			     HRTIMER_MODE_REL_PINNED_SOFT);
+		port_pcpu->tx_done_timer.function = mvpp2_hr_timer_cb;
+		port_pcpu->dev = port->dev;
+	}
+
+	if (!port_pcpu->timer_scheduled) {
+		port_pcpu->timer_scheduled = true;
+		hrtimer_start(&port_pcpu->tx_done_timer,
+			      MVPP2_TXDONE_HRTIMER_PERIOD_NS,
+			      HRTIMER_MODE_REL_PINNED_SOFT);
+	}
+}
+
+static void mvpp2_netmap_tx_timer_stop_cpu(void *arg)
+{
+	struct mvpp2_port *port = arg;
+	int cpu = smp_processor_id();
+	struct mvpp2_port_pcpu *port_pcpu;
+	unsigned int thread;
+
+	if (cpu >= port->priv->nthreads)
+		return;
+
+	thread = mvpp2_cpu_to_thread(port->priv, cpu);
+	port_pcpu = per_cpu_ptr(port->pcpu, thread);
+
+	/* Only tear the timer down entirely for has_tx_irqs ports - it's
+	 * netmap-only there. For !has_tx_irqs ports it's a native mechanism
+	 * that must keep working after netmap deactivates too, so just let
+	 * it naturally stop re-arming once idle (mvpp2_hr_timer_cb()) rather
+	 * than cancelling it here. */
+	if (port->has_tx_irqs) {
+		hrtimer_cancel(&port_pcpu->tx_done_timer);
+		port_pcpu->timer_scheduled = false;
+	}
+}
+
+/* TX-done IRQs are masked while netmap is active (see
+ * mvpp2_netmap_mask_tx_interrupts()), and even for ports without a TX-done
+ * IRQ the trickle-kick in mvpp2_tx() can go a whole netmap session without
+ * firing under sustained load. Make sure the per-thread TX-done heartbeat
+ * is running regardless of has_tx_irqs, so there is always something
+ * reaping completions and waking a stalled queue. */
+static void mvpp2_netmap_tx_timer_start(struct mvpp2_port *port)
+{
+	on_each_cpu(mvpp2_netmap_tx_timer_start_cpu, port, 1);
+}
+
+/* Undo mvpp2_netmap_tx_timer_start(). Must be called before TX interrupts
+ * are unmasked and native operation resumes, so the timer never outlives
+ * netmap deactivation (it touches port_pcpu/port state that native
+ * teardown may then free). */
+static void mvpp2_netmap_tx_timer_stop(struct mvpp2_port *port)
+{
+	on_each_cpu(mvpp2_netmap_tx_timer_stop_cpu, port, 1);
 }
 
 /* Enable queue interrupts */
@@ -555,12 +641,22 @@ static int mvpp2_netmap_reg(struct netmap_adapter *na, int onoff)
 				mvpp2_netmap_mask_tx_interrupts(port, r);
 				mna->irqs_enabled[r] = true;
 			}
+
+			/* Make sure the TX-done heartbeat is running to reap
+			 * completions/wake a stalled queue - has_tx_irqs
+			 * ports have no other way now that the TX-done IRQ
+			 * is masked above */
+			mvpp2_netmap_tx_timer_start(port);
 		}
 		nm_set_native_flags(na);
 	} else {
 		nm_clear_native_flags(na);
 		/* Restore all queues to native operation on last deactivation */
 		if (na->active_fds == 0) {
+			/* Stop the TX-done heartbeat before native TX
+			 * interrupts and teardown resume */
+			mvpp2_netmap_tx_timer_stop(port);
+
 			/* Use native buffer pools for port and destroy netmap buffer pools if no longer used */
 			mvpp2_netmap_stop(na);
 
